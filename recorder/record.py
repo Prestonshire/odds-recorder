@@ -36,7 +36,8 @@ import urllib.request
 BASE = "https://guest.api.arcadia.pinnacle.com/0.1"
 # Pinnacle's public website key (the one its own site uses), not a personal secret.
 GUEST_KEY = "CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R"
-SPORTS = {"basketball": 4, "american_football": 15, "ice_hockey": 19, "tennis": 33, "baseball": 3, "soccer": 29}
+SPORTS = {"basketball": 4, "american_football": 15, "ice_hockey": 19, "tennis": 33, "baseball": 3, "soccer": 29,
+          "esports": 12, "darts": 10, "snooker": 28, "volleyball": 34, "handball": 18}
 KEEP_TYPES = {"moneyline", "spread", "total"}
 KEEP_PERIODS = {0, 1}
 HORIZON_H = 36
