@@ -56,14 +56,24 @@ def iso(t: dt.datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def fetch(path: str, timeout=60):
+def fetch(path: str, timeout=60, tries=3, wait=4.0):
+    """GET a Pinnacle path. Brief hiccups (HTTP 429/5xx, timeouts) are retried a couple of times."""
     req = urllib.request.Request(BASE + path, headers={"X-API-Key": GUEST_KEY, "Accept": "application/json",
                                                        "Accept-Encoding": "gzip", "User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-        if r.headers.get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-    return json.loads(raw)
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+            return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == tries - 1:
+                raise
+        time.sleep(wait * (attempt + 1))
 
 
 def us_to_dec(a) -> float | None:
@@ -182,7 +192,7 @@ def run(minutes: float, poll_s: float, sports: dict, out_root=ROOT, fetcher=fetc
                     sinks[sport].add_games(games[sport], ts)
                 new = state_from(fetcher(f"/sports/{sid}/markets/straight?primaryOnly=true"), games[sport])
             except (urllib.error.URLError, OSError, ValueError) as e:
-                say(f"{ts} {sport}: read failed ({type(e).__name__}); will retry next poll")
+                say(f"{ts} {sport}: read failed ({type(e).__name__} {getattr(e, 'code', '')}); will retry next poll")
                 continue
             sinks[sport].prices += changes(state[sport], new, ts, first[sport])
             state[sport], first[sport] = new, False
