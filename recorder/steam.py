@@ -275,6 +275,7 @@ class SteamLogger:
         self.events, self.events_at, self.dead_sports = {}, {}, set()
         self.pending, self.checks, self.triggers = [], [], []
         self.ledger, self.ledger_sha, self.balance, self.disabled = None, None, None, None
+        self.probed = False
         self.counts = dict(triggers=0, rule_b=0, sampled=0, checks=0, tokens=0.0, unmatched=0, skipped_cap=0,
                            not_sampled=0, after_end=0, errors=0,
                            skipped_reserve=0, full_checks=0)
@@ -453,6 +454,9 @@ class SteamLogger:
         cid = f"{t['sport']}-{t['game_id']}-{now:%H%M%S}"
         validate = full_check(cid) and self._room(3.0)
         q = urllib.parse.urlencode({"eventIds": ev["id"], "markets": "h2h", "includeLiquidity": "true"})
+        if not self.probed:
+            self.probed = True
+            self._safe(self._probe, ev, now)
         st, hd, d, cost = self._or("/odds/raw?" + q)
         c = dict(id=cid, validate=validate, sport=t["sport"], game_id=t["game_id"],
                  or_event=ev["id"], or_home=ev.get("home_team"), or_away=ev.get("away_team"), match_score=score,
@@ -466,6 +470,27 @@ class SteamLogger:
             c["t2"], c["status2"], c["cost2"], c["reply2"] = None, None, 0.0, None
             self.checks.append(c)
         return "checked"
+
+    def _probe(self, ev, now):
+        """Once per run: ask OddsRelay's FREE price quote (quote=true) what variants of the one-match call would cost.
+        Prints prices in tokens only (no odds, no names). Added 6 Nov after the first live checks cost 3 tokens a call."""
+        base = {"eventIds": ev["id"], "markets": "h2h"}
+        sport = (ev.get("sport_key") or "").split("_")[0]
+        since = (now - dt.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        variants = [("as now", dict(base, includeLiquidity="true")),
+                    ("+sport", dict(base, includeLiquidity="true", sports=sport)),
+                    ("no liquidity", dict(base, includeLiquidity="false")),
+                    ("+sport no liquidity", dict(base, includeLiquidity="false", sports=sport)),
+                    ("changed-since", dict(base, includeLiquidity="true", updatedSince=since)),
+                    ("+sport changed-since", dict(base, includeLiquidity="true", sports=sport, updatedSince=since))]
+        out = []
+        for name, params in variants:
+            st, _hd, d, cost = self._or("/odds/raw?" + urllib.parse.urlencode(dict(params, quote="true")))
+            out.append(f"{name} {d.get('cost') if st == 200 and d else 'HTTP ' + str(st)}")
+            if cost:                      # a quote should be free; stop at once if it is not
+                out.append(f"(quotes charged {cost:g}: probe stopped)")
+                break
+        self.say(f"steam: price probe for one {sport or 'unknown'} match (free quotes, tokens): " + "; ".join(out))
 
     def _tick(self, now):
         due = [c for c in self.pending if (now - c["t1"]).total_seconds() >= RECHECK_S]
