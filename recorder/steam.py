@@ -47,7 +47,20 @@ MAX_START_H = 6                      # only games starting within 6 hours
 SAMPLE_ONE_IN = 10                   # A-only triggers checked: a fixed 1 in 10
 RECHECK_S = 60                       # second snapshot after 60 s
 SHARE_S = 60                         # triggers on the same match within 60 s share the calls
-CAP_WEEKDAY, CAP_WEEKEND, CAP_TOTAL, BALANCE_FLOOR = 150, 500, 6800, 1500
+# Amendment 2 (6 Nov 2026 evening, Mike): fixed 20-bookmaker list + sport filter (cheaper calls: 1-2 tokens v 3-7),
+# safety caps 250 weekdays / 800 weekends; total 6,800 and balance floor 1,500 up to Sat 21 Nov (protects the value
+# snapshots and racing); from Sun 22 Nov no total cap and a floor of 200 (accas only), because unused tokens are lost
+# when OddsRelay renews on 5 Dec.
+CAP_WEEKDAY, CAP_WEEKEND, CAP_TOTAL, BALANCE_FLOOR = 250, 800, 6800, 1500
+RELEASE_DAY, LATE_FLOOR = dt.date(2026, 11, 22), 200
+BOOKMAKERS = ["sky_bet", "betfair_sportsbook", "dabble", "betuk", "virgin_bet", "livescore_bet", "william_hill", "betmgm",
+              "ladbrokes", "betfred", "unibet", "888sport", "betvictor", "betway", "boylesports", "star_sports", "betano",
+              "hollywoodbets", "quinnbet", "betfair_exchange"]
+# Pre-written fallback (Amendment 2): if a checkpoint projects overspending, this rate (now 1 = everything) is lowered
+# for rule-B moves OUTSIDE main football, chosen by a fixed hash. Main football = these league-name prefixes.
+SAMPLE_OTHER = 1.0
+MAIN_FOOTBALL = ("England", "Scotland - Premiership", "Spain - La Liga", "Germany - Bundesliga", "Italy - Serie A",
+                 "France - Ligue 1", "UEFA")
 # Amendment 6 Nov 2026 (~10:15 UTC, Mike): the 60-second second look asks OddsRelay only for prices changed since the
 # first look (updatedSince, charged at a reduced "recent" rate); a fixed 1 in 10 checks also takes a full second
 # snapshot to measure whether "not listed = unchanged" holds. Once a day's spend reaches 80% of its cap, the
@@ -156,6 +169,17 @@ class Detector:
                 self.hist[k] = h
             self.prev_stake[(sport, gid)] = stake
         return trig
+
+
+def main_football(t) -> bool:
+    return t["sport"] == "soccer" and str(t.get("league", "")).startswith(MAIN_FOOTBALL)
+
+
+def other_sampled(t, rate) -> bool:
+    if rate >= 1:
+        return True
+    h = hashlib.sha256(f"other|{t['game_id']}|{t['side']}|{t['ts']:%Y-%m-%dT%H:%M:%SZ}".encode()).hexdigest()
+    return int(h, 16) % 1000 < rate * 1000
 
 
 def full_check(check_id: str) -> bool:
@@ -365,7 +389,7 @@ class SteamLogger:
         if self.balance is None:
             self.say(f"steam: OddsRelay balance unknown (HTTP {st}); no paid checks this run")
             return False
-        if self.balance < BALANCE_FLOOR:
+        if self.balance < self._floor():
             self.say("steam: OddsRelay balance below the floor; no paid checks this run")
             return False
         self.disabled = False
@@ -381,11 +405,14 @@ class SteamLogger:
         now, cap = self._cap()
         return self.ledger["days"].get(f"{now:%Y-%m-%d}", 0) >= RESERVE_SHARE * cap
 
+    def _floor(self):
+        return LATE_FLOOR if self.clock().date() >= RELEASE_DAY else BALANCE_FLOOR
+
     def _room(self, need=2.0) -> bool:
         now, cap = self._cap()
         day = self.ledger["days"].get(f"{now:%Y-%m-%d}", 0)
-        return (day + need <= cap and self.ledger.get("total", 0) + need <= CAP_TOTAL
-                and (self.balance or 0) - need >= BALANCE_FLOOR)
+        total_ok = now.date() >= RELEASE_DAY or self.ledger.get("total", 0) + need <= CAP_TOTAL
+        return day + need <= cap and total_ok and (self.balance or 0) - need >= self._floor()
 
     def _events(self, sport: str, now: dt.datetime) -> list:
         key = SPORT_MAP.get(sport)
@@ -440,7 +467,9 @@ class SteamLogger:
         if t["sampled"] and self._reserve_on():
             self.counts["skipped_reserve"] += 1
             return "skipped: reserve"
-        if (self.balance or 0) < BALANCE_FLOOR or not self._room():
+        if t["rule_b"] and not main_football(t) and not other_sampled(t, SAMPLE_OTHER):
+            return "not sampled (other)"
+        if (self.balance or 0) < self._floor() or not self._room():
             self.counts["skipped_cap"] += 1
             return "skipped: cap"
         ev, score, swapped = match_event({"start": t["start"], "home": t["home"], "away": t["away"]},
@@ -453,7 +482,9 @@ class SteamLogger:
             return "skipped: cap"
         cid = f"{t['sport']}-{t['game_id']}-{now:%H%M%S}"
         validate = full_check(cid) and self._room(3.0)
-        q = urllib.parse.urlencode({"eventIds": ev["id"], "markets": "h2h", "includeLiquidity": "true"})
+        q = urllib.parse.urlencode({"eventIds": ev["id"], "markets": "h2h", "includeLiquidity": "true",
+                                    "sports": (ev.get("sport_key") or SPORT_MAP.get(t["sport"], "")).split("_")[0],
+                                    "bookmakers": ",".join(BOOKMAKERS)})
         st, hd, d, cost = self._or("/odds/raw?" + q)
         if not self.probed and st == 200:   # after the first real look, so its bookmaker keys can be reused
             self.probed = True

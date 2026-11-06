@@ -175,7 +175,7 @@ def test_rule_b_trigger_gets_two_snapshots_and_saves_privately_without_printing_
 
 def test_daily_cap_and_balance_floor_stop_paid_checks():
     t = {"now": SAT}
-    fake = Fake(ledger={"days": {"2026-11-07": 499}, "total": 1000})
+    fake = Fake(ledger={"days": {"2026-11-07": 799}, "total": 1000})
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)
     assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]] and lg.counts["skipped_cap"] == 1
@@ -191,11 +191,11 @@ def test_daily_cap_and_balance_floor_stop_paid_checks():
     assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
 
 
-def test_weekday_cap_is_150():
+def test_weekday_cap_is_250():
     mon = dt.datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
     games = {7: dict(GAMES[7], start=mon + dt.timedelta(hours=3))}
     t = {"now": mon}
-    fake = Fake(ledger={"days": {"2026-11-09": 149}, "total": 149})
+    fake = Fake(ledger={"days": {"2026-11-09": 249}, "total": 249})
     lg, _ = logger(fake, lambda: t["now"])
     lg.on_reading("soccer", st(110, 240, 260, 3000), games, t["now"])
     t["now"] += dt.timedelta(minutes=2)
@@ -326,7 +326,7 @@ def test_full_check_choice_is_about_one_in_ten():
 def test_comparison_checks_held_back_after_80_percent_of_the_day(monkeypatch):
     monkeypatch.setattr(S, "sampled", lambda *a: True)
     t = {"now": SAT}
-    fake = Fake(ledger={"days": {"2026-11-07": 400}, "total": 400})       # 80% of Saturday's 500
+    fake = Fake(ledger={"days": {"2026-11-07": 640}, "total": 640})       # 80% of Saturday's 800
     lg, _ = logger(fake, lambda: t["now"])
     lg.on_reading("soccer", st(110, 240, 260, 3000), GAMES, t["now"])
     t["now"] += dt.timedelta(minutes=2)
@@ -334,7 +334,7 @@ def test_comparison_checks_held_back_after_80_percent_of_the_day(monkeypatch):
     assert lg.counts["skipped_reserve"] == 1 and lg.triggers[0]["reserve"]
     assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     t = {"now": SAT}
-    fake = Fake(ledger={"days": {"2026-11-07": 400}, "total": 400})
+    fake = Fake(ledger={"days": {"2026-11-07": 640}, "total": 640})
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)                                                          # rule B still checked
     assert [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
@@ -364,3 +364,45 @@ def test_probe_prices_smaller_bookmaker_lists(monkeypatch):
     line = [x for x in said if "price probe" in x][0]
     assert "venues in reply 25" in line and "20 books 3" in line and "all 25 books listed 3" in line
     assert "+sport 40 books 3" in line and "30 books" not in line
+
+
+def test_calls_ask_for_the_fixed_20_bookmakers_and_the_sport(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: False)
+    t = {"now": SAT}
+    fake = Fake()
+    lg, _ = logger(fake, lambda: t["now"])
+    drive(lg, t)
+    t["now"] += dt.timedelta(seconds=61)
+    lg.tick()
+    real = [c[1] for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
+    assert len(S.BOOKMAKERS) == 20 and "bet365" not in S.BOOKMAKERS and "paddy_power" not in S.BOOKMAKERS
+    assert real and all("sports=soccer" in u and "bookmakers=sky_bet%2Cbetfair_sportsbook" in u for u in real)
+
+
+def test_release_after_racing_ends(monkeypatch):
+    monkeypatch.setattr(S, "match_event", lambda g, ev: ({"id": "e1", "home_team": "A", "away_team": "B"}, 1.0, False))
+    late = dt.datetime(2026, 11, 22, 12, 0, tzinfo=UTC)                   # a Sunday
+    games = {7: dict(GAMES[7], start=late + dt.timedelta(hours=3))}
+    t = {"now": late}
+    fake = Fake(balance=900, ledger={"days": {}, "total": 6799})           # over the old total, under the old floor
+    lg, _ = logger(fake, lambda: t["now"])
+    lg.on_reading("soccer", st(110, 240, 260, 3000), games, t["now"])
+    t["now"] += dt.timedelta(minutes=2)
+    lg.on_reading("soccer", st(-105, 250, 280, 5000), games, t["now"])
+    assert lg.counts["checks"] == 1
+
+
+def test_fallback_sampling_only_touches_moves_outside_main_football(monkeypatch):
+    monkeypatch.setattr(S, "SAMPLE_OTHER", 0.0)
+    t = {"now": SAT}
+    fake = Fake()
+    lg, _ = logger(fake, lambda: t["now"])
+    drive(lg, t)                                                          # Premier League: still checked
+    assert lg.counts["checks"] == 1
+    other = {7: dict(GAMES[7], league="Poland - Ekstraklasa")}
+    t = {"now": SAT}
+    lg, _ = logger(Fake(), lambda: t["now"])
+    lg.on_reading("soccer", st(110, 240, 260, 3000), other, t["now"])
+    t["now"] += dt.timedelta(minutes=2)
+    lg.on_reading("soccer", st(-105, 250, 280, 5000), other, t["now"])
+    assert lg.counts["checks"] == 0 and lg.triggers[0]["action"] == "not sampled (other)"
