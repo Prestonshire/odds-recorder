@@ -91,8 +91,9 @@ def test_trim_reply_keeps_only_match_winner_prices():
 
 # ------------------------------------------------------------------ the logger with fake OddsRelay and GitHub
 class Fake:
-    def __init__(self, balance=40000, ledger=None, raw_cost="1"):
+    def __init__(self, balance=40000, ledger=None, raw_cost="1", delta=None):
         self.calls, self.puts, self.balance, self.ledger, self.raw_cost = [], {}, balance, ledger, raw_cost
+        self.delta = delta or []      # venues returned by the "changed since" second look
 
     def __call__(self, method, url, headers, body=None, timeout=30):
         self.calls.append((method, url, dict(headers)))
@@ -112,6 +113,9 @@ class Fake:
             return 200, dict(h, **{"x-tokens-cost": "0"}), json.dumps({"data": [
                 {"id": "e1", "commence_time": "2026-11-07T15:00:00Z", "home_team": "Arsenal",
                  "away_team": "Chelsea"}], "meta": {"next_cursor": None}}).encode()
+        if "/odds/raw" in url and "updatedSince=" in url:
+            body = {"data": [{"id": "e1", "bookmakers": self.delta}] if self.delta else []}
+            return 200, dict(h, **{"x-tokens-cost": "0.1"}), json.dumps(body).encode()
         if "/odds/raw" in url:
             if headers.get("If-None-Match") == "W/1":
                 return 304, dict(h, **{"x-tokens-cost": "0"}), b""
@@ -136,7 +140,8 @@ def drive(lg, t):
     lg.on_reading("soccer", st(-105, 250, 280, 5000), GAMES, t["now"])
 
 
-def test_rule_b_trigger_gets_two_snapshots_and_saves_privately_without_printing_prices():
+def test_rule_b_trigger_gets_two_snapshots_and_saves_privately_without_printing_prices(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: False)
     t = {"now": SAT}
     fake = Fake()
     lg, said = logger(fake, lambda: t["now"])
@@ -149,15 +154,16 @@ def test_rule_b_trigger_gets_two_snapshots_and_saves_privately_without_printing_
     t["now"] += dt.timedelta(seconds=31)
     lg.tick()
     raw = [c for c in fake.calls if "/odds/raw" in c[1]]
-    assert len(raw) == 2 and raw[1][2].get("If-None-Match") == "W/1"          # free 304 re-check
+    assert len(raw) == 2 and "updatedSince=2026-11-07T12:02:25Z" in raw[1][1]   # cheap "changed since" look
     lg.finish(sleep=lambda s: None)
     paths = sorted(fake.puts)
     assert all(p.startswith("data/steam_logger/") for p in paths) and len(paths) == 3
     checks = gzip.decompress(base64.b64decode(fake.puts[[p for p in paths if "checks" in p][0]]["content"]))
     c = json.loads(checks.decode().splitlines()[0])
-    assert c["status2"] == 304 and c["reply2"] == c["reply1"] and c["reply1"][0]["k"] == "william_hill"
+    assert c["status2"] == 200 and c["reply2"] == c["reply1"] and c["reply1"][0]["k"] == "william_hill"
+    assert c["method2"] == "changed-since" and c["changed2"] == []
     ledger = json.loads(base64.b64decode(fake.puts["data/steam_logger/ledger.json"]["content"]))
-    assert ledger["total"] == 1 and ledger["days"]["2026-11-07"] == 1
+    assert abs(ledger["total"] - 1.1) < 1e-9 and abs(ledger["days"]["2026-11-07"] - 1.1) < 1e-9
     text = " ".join(said)
     for secret in ("2.2", "william", "Arsenal", "KEY-SECRET", "GH-SECRET"):
         assert secret not in text
@@ -204,7 +210,7 @@ def test_after_the_end_date_nothing_is_paid_for():
     lg.on_reading("soccer", st(110, 240, 260, 3000), games, t["now"])
     t["now"] += dt.timedelta(minutes=2)
     lg.on_reading("soccer", st(-105, 250, 280, 5000), games, t["now"])
-    assert lg.counts["after_end"] == 1 and not [c for c in fake.calls if "oddsrelay" in c[1]]
+    assert lg.counts["after_end"] == 1 and not [c for c in fake.calls if "/odds/" in c[1]]
 
 
 def test_a_only_triggers_not_sampled_cost_nothing(monkeypatch):
@@ -215,7 +221,7 @@ def test_a_only_triggers_not_sampled_cost_nothing(monkeypatch):
     lg.on_reading("soccer", st(110, 240, 260, 3000), GAMES, t["now"])
     t["now"] += dt.timedelta(minutes=2)
     lg.on_reading("soccer", st(-105, 250, 280, 3000), GAMES, t["now"])      # stake unchanged: A only
-    assert lg.counts["not_sampled"] == 1 and not fake.calls
+    assert lg.counts["not_sampled"] == 1 and not [c for c in fake.calls if "/odds/" in c[1]]
 
 
 def test_errors_inside_the_logger_never_stop_the_recorder(tmp_path):
@@ -283,3 +289,50 @@ def test_start_up_check_reports_without_numbers():
     lg, said = logger(fake, lambda: SAT)
     lg.seed("soccer")
     assert any(x.startswith("steam: on") for x in said)
+
+
+def test_changed_prices_and_withdrawn_prices_show_in_the_second_look(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: False)
+    t = {"now": SAT}
+    fake = Fake(delta=[{"key": "william_hill", "last_update": "t2", "markets": []}])   # price withdrawn
+    lg, _ = logger(fake, lambda: t["now"])
+    drive(lg, t)
+    t["now"] += dt.timedelta(seconds=61)
+    lg.tick()
+    c = lg.checks[0]
+    assert c["reply2"] == [{"k": "william_hill", "u": "t2", "o": []}]   # gone, not "still on offer"
+
+
+def test_one_in_ten_checks_also_take_a_full_second_snapshot(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: True)
+    t = {"now": SAT}
+    fake = Fake()
+    lg, said = logger(fake, lambda: t["now"])
+    drive(lg, t)
+    t["now"] += dt.timedelta(seconds=61)
+    lg.tick()
+    raw = [c for c in fake.calls if "/odds/raw" in c[1]]
+    assert len(raw) == 3 and raw[2][2].get("If-None-Match") == "W/1"
+    c = lg.checks[0]
+    assert c["validate"] and c["status_full"] == 304 and c["reply2_full"] == c["reply1"]
+
+
+def test_full_check_choice_is_about_one_in_ten():
+    assert sum(S.full_check(f"x{i}") for i in range(5000)) in range(400, 600)
+
+
+def test_comparison_checks_held_back_after_80_percent_of_the_day(monkeypatch):
+    monkeypatch.setattr(S, "sampled", lambda *a: True)
+    t = {"now": SAT}
+    fake = Fake(ledger={"days": {"2026-11-07": 400}, "total": 400})       # 80% of Saturday's 500
+    lg, _ = logger(fake, lambda: t["now"])
+    lg.on_reading("soccer", st(110, 240, 260, 3000), GAMES, t["now"])
+    t["now"] += dt.timedelta(minutes=2)
+    lg.on_reading("soccer", st(-105, 250, 280, 3000), GAMES, t["now"])    # A-only (no stake rise)
+    assert lg.counts["skipped_reserve"] == 1 and lg.triggers[0]["reserve"]
+    assert not [c for c in fake.calls if "/odds/raw" in c[1]]
+    t = {"now": SAT}
+    fake = Fake(ledger={"days": {"2026-11-07": 400}, "total": 400})
+    lg, _ = logger(fake, lambda: t["now"])
+    drive(lg, t)                                                          # rule B still checked
+    assert [c for c in fake.calls if "/odds/raw" in c[1]]

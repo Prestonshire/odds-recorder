@@ -48,6 +48,13 @@ SAMPLE_ONE_IN = 10                   # A-only triggers checked: a fixed 1 in 10
 RECHECK_S = 60                       # second snapshot after 60 s
 SHARE_S = 60                         # triggers on the same match within 60 s share the calls
 CAP_WEEKDAY, CAP_WEEKEND, CAP_TOTAL, BALANCE_FLOOR = 150, 500, 6800, 1500
+# Amendment 6 Nov 2026 (~10:15 UTC, Mike): the 60-second second look asks OddsRelay only for prices changed since the
+# first look (updatedSince, charged at a reduced "recent" rate); a fixed 1 in 10 checks also takes a full second
+# snapshot to measure whether "not listed = unchanged" holds. Once a day's spend reaches 80% of its cap, the
+# 1-in-10 comparison checks stop (rule-B checks continue); triggers carry a "reserve" flag so the comparison can use
+# only the part of each day before the switch.
+RESERVE_SHARE = 0.8
+FULL_CHECK_ONE_IN = 10
 LAST_CHECK_DAY = dt.date(2026, 12, 4)  # verdict on Sat 5 Dec: no paid checks after Fri 4 Dec (UTC)
 MATCH_MINUTES, MATCH_SCORE = 30, 0.7
 EVENTS_REFRESH_S = 600
@@ -56,7 +63,7 @@ SPORT_MAP = {"soccer": "soccer", "tennis": "tennis", "basketball": "basketball",
              "american_football": "american_football", "baseball": "baseball", "esports": "esports",
              "darts": "darts", "snooker": "snooker", "volleyball": "volleyball", "handball": "handball"}
 TRIGGER_COLS = ["ts_utc", "sport", "game_id", "league", "home", "away", "start_utc", "side", "fair_now", "fair_low",
-                "rise", "max_stake", "prev_stake", "rule_b", "rule_c", "sampled", "action", "check_id"]
+                "rise", "max_stake", "prev_stake", "rule_b", "rule_c", "sampled", "action", "check_id", "reserve"]
 
 
 # ------------------------------------------------------------------ fair chances (Shin's method)
@@ -149,6 +156,11 @@ class Detector:
                 self.hist[k] = h
             self.prev_stake[(sport, gid)] = stake
         return trig
+
+
+def full_check(check_id: str) -> bool:
+    """The fixed 1-in-10 checks that also take a full second snapshot (validation of the cheap second look)."""
+    return int(hashlib.sha256(f"full|{check_id}".encode()).hexdigest(), 16) % FULL_CHECK_ONE_IN == 0
 
 
 def sampled(gid, side, ts: dt.datetime) -> bool:
@@ -246,12 +258,9 @@ def trim_reply(data: dict, event_id: str) -> list:
         if e.get("id") != event_id and event_id not in (e.get("previous_ids") or []):
             continue
         for b in e.get("bookmakers") or []:
-            for m in b.get("markets") or []:
-                if m.get("key") != "h2h":
-                    continue
-                outs = [{k: o.get(k) for k in ("name", "price", "lay_price", "available") if k in o}
-                        for o in m.get("outcomes") or []]
-                keep.append({"k": b.get("key"), "u": b.get("last_update"), "o": outs})
+            outs = [{k: o.get(k) for k in ("name", "price", "lay_price", "available") if k in o}
+                    for m in b.get("markets") or [] if m.get("key") == "h2h" for o in m.get("outcomes") or []]
+            keep.append({"k": b.get("key"), "u": b.get("last_update"), "o": outs})   # o == []: no price now
     return keep
 
 
@@ -267,7 +276,8 @@ class SteamLogger:
         self.pending, self.checks, self.triggers = [], [], []
         self.ledger, self.ledger_sha, self.balance, self.disabled = None, None, None, None
         self.counts = dict(triggers=0, rule_b=0, sampled=0, checks=0, tokens=0.0, unmatched=0, skipped_cap=0,
-                           not_sampled=0, after_end=0, errors=0)
+                           not_sampled=0, after_end=0, errors=0,
+                           skipped_reserve=0, full_checks=0)
 
     # --- safe wrappers: the recorder must never be harmed by the logger
     def _safe(self, fn, *a):
@@ -360,9 +370,18 @@ class SteamLogger:
         self.disabled = False
         return True
 
-    def _room(self, need=2.0) -> bool:
+    def _cap(self):
         now = self.clock()
-        cap = CAP_WEEKEND if now.weekday() >= 5 else CAP_WEEKDAY
+        return now, (CAP_WEEKEND if now.weekday() >= 5 else CAP_WEEKDAY)
+
+    def _reserve_on(self) -> bool:
+        if self.ledger is None:
+            return False
+        now, cap = self._cap()
+        return self.ledger["days"].get(f"{now:%Y-%m-%d}", 0) >= RESERVE_SHARE * cap
+
+    def _room(self, need=2.0) -> bool:
+        now, cap = self._cap()
         day = self.ledger["days"].get(f"{now:%Y-%m-%d}", 0)
         return (day + need <= cap and self.ledger.get("total", 0) + need <= CAP_TOTAL
                 and (self.balance or 0) - need >= BALANCE_FLOOR)
@@ -396,7 +415,10 @@ class SteamLogger:
             self.counts["triggers"] += 1
             self.counts["rule_b"] += t["rule_b"]
             self.counts["sampled"] += t["sampled"]
-            t["action"], t["check_id"] = self._decide(t, now), ""
+            if self.disabled is None:
+                self._ready()                 # normally already done at the start of the run
+            t["reserve"], t["check_id"] = self._reserve_on(), ""
+            t["action"] = self._decide(t, now)
             self.triggers.append(t)
 
     def _decide(self, t, now) -> str:
@@ -414,6 +436,9 @@ class SteamLogger:
                 c["triggers"].append(_tid(t))
                 t["check_id"] = c["id"]
                 return "shared"
+        if t["sampled"] and self._reserve_on():
+            self.counts["skipped_reserve"] += 1
+            return "skipped: reserve"
         if (self.balance or 0) < BALANCE_FLOOR or not self._room():
             self.counts["skipped_cap"] += 1
             return "skipped: cap"
@@ -425,9 +450,11 @@ class SteamLogger:
         if not self._room():          # an events page could in theory cost tokens
             self.counts["skipped_cap"] += 1
             return "skipped: cap"
+        cid = f"{t['sport']}-{t['game_id']}-{now:%H%M%S}"
+        validate = full_check(cid) and self._room(3.0)
         q = urllib.parse.urlencode({"eventIds": ev["id"], "markets": "h2h", "includeLiquidity": "true"})
         st, hd, d, cost = self._or("/odds/raw?" + q)
-        c = dict(id=f"{t['sport']}-{t['game_id']}-{now:%H%M%S}", sport=t["sport"], game_id=t["game_id"],
+        c = dict(id=cid, validate=validate, sport=t["sport"], game_id=t["game_id"],
                  or_event=ev["id"], or_home=ev.get("home_team"), or_away=ev.get("away_team"), match_score=score,
                  swapped=swapped, triggers=[_tid(t)], t1=now, status1=st, cost1=cost, reply1=trim_reply(d, ev["id"]),
                  etag=hd.get("etag"), q=q)
@@ -444,9 +471,20 @@ class SteamLogger:
         due = [c for c in self.pending if (now - c["t1"]).total_seconds() >= RECHECK_S]
         for c in due:
             self.pending.remove(c)
-            st, _hd, d, cost = self._or("/odds/raw?" + c["q"], etag=c.get("etag"))
-            c.update(t2=now, status2=st, cost2=cost,
-                     reply2=c["reply1"] if st == 304 else trim_reply(d, c["or_event"]))
+            since = (c["t1"] - dt.timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            st, _hd, d, cost = self._or("/odds/raw?" + c["q"] + "&updatedSince=" + since)
+            reply2 = changed = None
+            if st == 200:                 # only venues that changed since the first look; the rest are unchanged
+                changed = trim_reply(d, c["or_event"])
+                merged = {b["k"]: b for b in c["reply1"]}
+                merged.update({b["k"]: b for b in changed})
+                reply2 = list(merged.values())
+            c.update(t2=now, method2="changed-since", status2=st, cost2=cost, changed2=changed, reply2=reply2)
+            if c.get("validate"):         # full second snapshot, to measure the cheap method's error
+                st3, _h3, d3, cost3 = self._or("/odds/raw?" + c["q"], etag=c.get("etag"))
+                self.counts["full_checks"] += 1
+                c.update(status_full=st3, cost_full=cost3,
+                         reply2_full=c["reply1"] if st3 == 304 else trim_reply(d3, c["or_event"]))
             self.checks.append(c)
 
     def _finish(self, sleep):
@@ -458,7 +496,8 @@ class SteamLogger:
         n = self.counts
         self.say(f"steam: {n['triggers']} triggers ({n['rule_b']} rule B, {n['sampled']} sampled A-only), "
                  f"{n['checks']} checks, {n['tokens']:g} tokens, {n['unmatched']} unmatched, "
-                 f"{n['skipped_cap']} skipped by the cap, {n['errors']} errors")
+                 f"{n['skipped_cap']} skipped by the cap, {n['skipped_reserve']} comparison checks held back, "
+                 f"{n['full_checks']} full re-checks, {n['errors']} errors")
         if not self.triggers:
             return
         stem = f"{OUT_DIR}/{self.run_start:%Y-%m-%d}/{self.run_start:%H%M}"
@@ -503,7 +542,7 @@ def _triggers_csv(triggers) -> bytes:
         w.writerow([_iso(t["ts"]), t["sport"], t["game_id"], t["league"], t["home"], t["away"], _iso(t["start"]),
                     t["side"], round(t["fair_now"], 6), round(t["fair_low"], 6), round(t["rise"], 6), t["max_stake"],
                     t["prev_stake"], int(t["rule_b"]), int(t["rule_c"]), int(t["sampled"]), t["action"],
-                    t["check_id"]])
+                    t["check_id"], int(t.get("reserve", 0))])
     return gzip.compress(buf.getvalue().encode())
 
 
