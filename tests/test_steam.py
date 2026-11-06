@@ -113,6 +113,8 @@ class Fake:
             return 200, dict(h, **{"x-tokens-cost": "0"}), json.dumps({"data": [
                 {"id": "e1", "commence_time": "2026-11-07T15:00:00Z", "home_team": "Arsenal",
                  "away_team": "Chelsea"}], "meta": {"next_cursor": None}}).encode()
+        if "/odds/raw" in url and "quote=true" in url:
+            return 200, dict(h, **{"x-tokens-cost": "0"}), json.dumps({"cost": 3, "remaining": self.balance}).encode()
         if "/odds/raw" in url and "updatedSince=" in url:
             body = {"data": [{"id": "e1", "bookmakers": self.delta}] if self.delta else []}
             return 200, dict(h, **{"x-tokens-cost": "0.1"}), json.dumps(body).encode()
@@ -146,14 +148,14 @@ def test_rule_b_trigger_gets_two_snapshots_and_saves_privately_without_printing_
     fake = Fake()
     lg, said = logger(fake, lambda: t["now"])
     drive(lg, t)
-    raw = [c for c in fake.calls if "/odds/raw" in c[1]]
+    raw = [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     assert len(raw) == 1 and "eventIds=e1" in raw[0][1]
     t["now"] += dt.timedelta(seconds=30)
     lg.tick()
-    assert len([c for c in fake.calls if "/odds/raw" in c[1]]) == 1          # not due yet
+    assert len([c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]) == 1          # not due yet
     t["now"] += dt.timedelta(seconds=31)
     lg.tick()
-    raw = [c for c in fake.calls if "/odds/raw" in c[1]]
+    raw = [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     assert len(raw) == 2 and "updatedSince=2026-11-07T12:02:25Z" in raw[1][1]   # cheap "changed since" look
     lg.finish(sleep=lambda s: None)
     paths = sorted(fake.puts)
@@ -176,17 +178,17 @@ def test_daily_cap_and_balance_floor_stop_paid_checks():
     fake = Fake(ledger={"days": {"2026-11-07": 499}, "total": 1000})
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)
-    assert not [c for c in fake.calls if "/odds/raw" in c[1]] and lg.counts["skipped_cap"] == 1
+    assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]] and lg.counts["skipped_cap"] == 1
     t = {"now": SAT}
     fake = Fake(balance=1501)
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)
-    assert not [c for c in fake.calls if "/odds/raw" in c[1]]
+    assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     t = {"now": SAT}
     fake = Fake(ledger={"days": {}, "total": 6799})
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)
-    assert not [c for c in fake.calls if "/odds/raw" in c[1]]
+    assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
 
 
 def test_weekday_cap_is_150():
@@ -311,7 +313,7 @@ def test_one_in_ten_checks_also_take_a_full_second_snapshot(monkeypatch):
     drive(lg, t)
     t["now"] += dt.timedelta(seconds=61)
     lg.tick()
-    raw = [c for c in fake.calls if "/odds/raw" in c[1]]
+    raw = [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     assert len(raw) == 3 and raw[2][2].get("If-None-Match") == "W/1"
     c = lg.checks[0]
     assert c["validate"] and c["status_full"] == 304 and c["reply2_full"] == c["reply1"]
@@ -330,9 +332,24 @@ def test_comparison_checks_held_back_after_80_percent_of_the_day(monkeypatch):
     t["now"] += dt.timedelta(minutes=2)
     lg.on_reading("soccer", st(-105, 250, 280, 3000), GAMES, t["now"])    # A-only (no stake rise)
     assert lg.counts["skipped_reserve"] == 1 and lg.triggers[0]["reserve"]
-    assert not [c for c in fake.calls if "/odds/raw" in c[1]]
+    assert not [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
     t = {"now": SAT}
     fake = Fake(ledger={"days": {"2026-11-07": 400}, "total": 400})
     lg, _ = logger(fake, lambda: t["now"])
     drive(lg, t)                                                          # rule B still checked
-    assert [c for c in fake.calls if "/odds/raw" in c[1]]
+    assert [c for c in fake.calls if "/odds/raw" in c[1] and "quote=true" not in c[1]]
+
+
+def test_price_probe_runs_once_per_run_free_and_prints_numbers_only(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: False)
+    t = {"now": SAT}
+    fake = Fake()
+    lg, said = logger(fake, lambda: t["now"])
+    drive(lg, t)
+    probes = [c for c in fake.calls if "quote=true" in c[1]]
+    assert len(probes) == 6 and lg.counts["tokens"] == 1          # quotes free; only the real call charged
+    line = [x for x in said if "price probe" in x][0]
+    assert "as now 3" in line and "Arsenal" not in line and "william" not in line
+    t["now"] += dt.timedelta(minutes=70)
+    lg.on_reading("soccer", st(-130, 260, 300, 8000), GAMES, t["now"])
+    assert len([c for c in fake.calls if "quote=true" in c[1]]) == 6   # not again in the same run
