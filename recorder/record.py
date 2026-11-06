@@ -172,8 +172,12 @@ class Sink:
 
 
 def run(minutes: float, poll_s: float, sports: dict, out_root=ROOT, fetcher=fetch, clock=utcnow, sleep=time.sleep,
-        say=print) -> list:
+        say=print, steam=None) -> list:
+    """steam: optional steam logger (recorder/steam.py); None = record Pinnacle prices only, as before."""
     start = clock()
+    if steam is not None:
+        for s in sports:
+            steam.seed(s)
     end = start + dt.timedelta(minutes=minutes)
     sinks = {s: Sink(s, start, out_root) for s in sports}
     state = {s: {} for s in sports}
@@ -196,13 +200,24 @@ def run(minutes: float, poll_s: float, sports: dict, out_root=ROOT, fetcher=fetc
                 continue
             sinks[sport].prices += changes(state[sport], new, ts, first[sport])
             state[sport], first[sport] = new, False
+            if steam is not None:
+                steam.on_reading(sport, new, games[sport], now)
+                steam.tick(clock())
         polls += 1
         if clock() + dt.timedelta(seconds=poll_s) > end:
             break
-        sleep(poll_s)
+        if steam is None:
+            sleep(poll_s)
+        else:                                   # wait in short steps so 60-second re-checks happen on time
+            until = clock() + dt.timedelta(seconds=poll_s)
+            while (left := (until - clock()).total_seconds()) > 0:
+                sleep(min(5.0, left))
+                steam.tick(clock())
     paths = []
     for s in sinks.values():
         paths += s.write()
+    if steam is not None:
+        steam.finish(sleep)
     say(f"{polls} polls; wrote {len(paths)} files: " + ", ".join(
         f"{s.sport} {len(s.prices):,} price rows / {len(s.games):,} games" for s in sinks.values()))
     return paths
@@ -215,7 +230,8 @@ def main(argv=None):
     ap.add_argument("--sports", default=",".join(SPORTS), help="comma list from: " + ", ".join(SPORTS))
     a = ap.parse_args(argv)
     chosen = {s: SPORTS[s] for s in a.sports.split(",") if s in SPORTS}
-    run(a.minutes, a.poll, chosen)
+    import steam as steam_logger  # same folder
+    run(a.minutes, a.poll, chosen, steam=steam_logger.from_env(ROOT, utcnow()))
     return 0
 
 

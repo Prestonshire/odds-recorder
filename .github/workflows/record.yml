@@ -28,6 +28,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Record
+        env:
+          # Steam logger (recorder/steam.py). Both empty = logger off. Never echo these.
+          ODDSRELAY_KEY: ${{ secrets.ODDSRELAY_KEY }}
+          STEAM_PUSH_TOKEN: ${{ secrets.STEAM_PUSH_TOKEN }}
         run: python recorder/record.py --minutes "${{ github.event.inputs.minutes || '52' }}"
       - name: Commit
         run: |
