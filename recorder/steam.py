@@ -279,6 +279,10 @@ class SteamLogger:
             return None
 
     def seed(self, sport: str):
+        if self.disabled is None:             # first call of the run: free start-up check, counts only in the log
+            ok = self._safe(self._ready)
+            self.say("steam: on (private repo and OddsRelay reachable, balance above the floor)" if ok
+                     else "steam: no paid checks this run (see the line above)")
         self._safe(self._seed, sport)
 
     def on_reading(self, sport: str, state: dict, games: dict, now: dt.datetime):
@@ -349,6 +353,9 @@ class SteamLogger:
             self.balance = (u.get("tokens") or {}).get("remaining", self.balance)
         if self.balance is None:
             self.say(f"steam: OddsRelay balance unknown (HTTP {st}); no paid checks this run")
+            return False
+        if self.balance < BALANCE_FLOOR:
+            self.say("steam: OddsRelay balance below the floor; no paid checks this run")
             return False
         self.disabled = False
         return True

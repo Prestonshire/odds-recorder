@@ -272,3 +272,14 @@ def test_replay_seeds_history_from_the_previous_run(tmp_path):
     lg.seed("soccer")
     trig = lg.det.update("soccer", st(-105, 250, 280, 5000), GAMES, SAT)
     assert len(trig) == 1 and trig[0]["rule_b"]
+
+
+def test_start_up_check_reports_without_numbers():
+    fake = Fake(balance=1200)
+    lg, said = logger(fake, lambda: SAT)
+    lg.seed("soccer")
+    assert any("no paid checks" in x for x in said) and not any("1200" in x for x in said)
+    fake = Fake()
+    lg, said = logger(fake, lambda: SAT)
+    lg.seed("soccer")
+    assert any(x.startswith("steam: on") for x in said)
