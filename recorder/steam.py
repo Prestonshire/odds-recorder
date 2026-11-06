@@ -485,9 +485,14 @@ class SteamLogger:
                     ("changed-since", dict(base, includeLiquidity="true", updatedSince=since)),
                     ("+sport changed-since", dict(base, includeLiquidity="true", sports=sport, updatedSince=since))]
         books = [b for b in books if b]
-        for n in (5, 10, 20):             # does the price depend on how many bookmakers are asked for?
+        for n in (20, 25, 30, 40, 50):    # where does the price start rising above 1 token?
             if len(books) > n:
                 variants.append((f"{n} books", dict(base, includeLiquidity="true", bookmakers=",".join(books[:n]))))
+        if books:
+            variants.append((f"all {len(books)} books listed", dict(base, includeLiquidity="true",
+                                                                     bookmakers=",".join(books))))
+            variants.append(("+sport 40 books", dict(base, includeLiquidity="true", sports=sport,
+                                                     bookmakers=",".join(books[:40]))))
         out.append(f"venues in reply {len(books)}")
         for name, params in variants:
             st, _hd, d, cost = self._or("/odds/raw?" + urllib.parse.urlencode(dict(params, quote="true")))
