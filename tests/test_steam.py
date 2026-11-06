@@ -348,8 +348,18 @@ def test_price_probe_runs_once_per_run_free_and_prints_numbers_only(monkeypatch)
     drive(lg, t)
     probes = [c for c in fake.calls if "quote=true" in c[1]]
     assert len(probes) == 6 and lg.counts["tokens"] == 1          # quotes free; only the real call charged
+    # (the fake reply has 1 bookmaker, so no "N books" variants are added)
     line = [x for x in said if "price probe" in x][0]
     assert "as now 3" in line and "Arsenal" not in line and "william" not in line
     t["now"] += dt.timedelta(minutes=70)
     lg.on_reading("soccer", st(-130, 260, 300, 8000), GAMES, t["now"])
     assert len([c for c in fake.calls if "quote=true" in c[1]]) == 6   # not again in the same run
+
+
+def test_probe_prices_smaller_bookmaker_lists(monkeypatch):
+    monkeypatch.setattr(S, "full_check", lambda cid: False)
+    lg, said = logger(Fake(), lambda: SAT)
+    lg.ledger, lg.disabled, lg.balance = {"days": {}, "total": 0}, False, 40000
+    lg._probe({"id": "e1", "sport_key": "soccer_epl"}, SAT, [f"book{i}" for i in range(25)])
+    line = [x for x in said if "price probe" in x][0]
+    assert "venues in reply 25" in line and "5 books 3" in line and "20 books 3" in line

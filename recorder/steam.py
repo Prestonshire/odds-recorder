@@ -454,10 +454,10 @@ class SteamLogger:
         cid = f"{t['sport']}-{t['game_id']}-{now:%H%M%S}"
         validate = full_check(cid) and self._room(3.0)
         q = urllib.parse.urlencode({"eventIds": ev["id"], "markets": "h2h", "includeLiquidity": "true"})
-        if not self.probed:
-            self.probed = True
-            self._safe(self._probe, ev, now)
         st, hd, d, cost = self._or("/odds/raw?" + q)
+        if not self.probed and st == 200:   # after the first real look, so its bookmaker keys can be reused
+            self.probed = True
+            self._safe(self._probe, ev, now, [b["k"] for b in trim_reply(d, ev["id"])])
         c = dict(id=cid, validate=validate, sport=t["sport"], game_id=t["game_id"],
                  or_event=ev["id"], or_home=ev.get("home_team"), or_away=ev.get("away_team"), match_score=score,
                  swapped=swapped, triggers=[_tid(t)], t1=now, status1=st, cost1=cost, reply1=trim_reply(d, ev["id"]),
@@ -471,9 +471,10 @@ class SteamLogger:
             self.checks.append(c)
         return "checked"
 
-    def _probe(self, ev, now):
+    def _probe(self, ev, now, books=()):
         """Once per run: ask OddsRelay's FREE price quote (quote=true) what variants of the one-match call would cost.
         Prints prices in tokens only (no odds, no names). Added 6 Nov after the first live checks cost 3 tokens a call."""
+        out = []
         base = {"eventIds": ev["id"], "markets": "h2h"}
         sport = (ev.get("sport_key") or "").split("_")[0]
         since = (now - dt.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -483,7 +484,11 @@ class SteamLogger:
                     ("+sport no liquidity", dict(base, includeLiquidity="false", sports=sport)),
                     ("changed-since", dict(base, includeLiquidity="true", updatedSince=since)),
                     ("+sport changed-since", dict(base, includeLiquidity="true", sports=sport, updatedSince=since))]
-        out = []
+        books = [b for b in books if b]
+        for n in (5, 10, 20):             # does the price depend on how many bookmakers are asked for?
+            if len(books) > n:
+                variants.append((f"{n} books", dict(base, includeLiquidity="true", bookmakers=",".join(books[:n]))))
+        out.append(f"venues in reply {len(books)}")
         for name, params in variants:
             st, _hd, d, cost = self._or("/odds/raw?" + urllib.parse.urlencode(dict(params, quote="true")))
             out.append(f"{name} {d.get('cost') if st == 200 and d else 'HTTP ' + str(st)}")
